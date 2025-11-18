@@ -4,19 +4,41 @@ import requests
 from datetime import datetime, timedelta, date
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
+from pathlib import Path  # <- neu
 
 # ---------- HTTP / Daten ----------
 
 CURRENCY_DEFAULT = "EUR"
-RYR_URL = "https://www.ryanair.com/api/farfnd/v4/oneWayFares/{}/{}/cheapestPerDay"
 HEADERS = {"Accept": "application/json", "User-Agent": "RoundtripFinder/1.3 (PySide6)"}
 
+# Konfig-Datei mit der API-URL (wird nicht in Git eingecheckt)
+BASE_DIR = Path(__file__).resolve().parent.parent  # src -> .. = Projektordner
+CONFIG_PATH = BASE_DIR / "data" / "ryanair_api.txt"
+_RYR_URL_CACHE: Optional[str] = None
+
+def get_ryr_url_template() -> str:
+    """Liest die Ryanair-API-URL-Vorlage aus data/ryanair_api.txt."""
+    global _RYR_URL_CACHE
+    if _RYR_URL_CACHE is not None:
+        return _RYR_URL_CACHE
+
+    try:
+        text = CONFIG_PATH.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        raise RuntimeError(f"Konfigurationsdatei nicht gefunden: {CONFIG_PATH}")
+
+    if not text or "{" not in text:
+        raise RuntimeError("Ungültige API-URL in 'ryanair_api.txt'.")
+
+    _RYR_URL_CACHE = text
+    return _RYR_URL_CACHE
 
 def fetch_cheapest_per_day_map(origin_iata: str, dest_iata: str, y: int, m: int, curr: str = CURRENCY_DEFAULT) -> Dict[str, dict]:
     """Holt fuer Monat y-m die cheapestPerDay-Daten.
        Rueckgabe: dict[YYYY-MM-DD] = { price: float, dep: str|None, arr: str|None }"""
     month_str = f"{y:04d}-{m:02d}-01"
-    url = RYR_URL.format(origin_iata, dest_iata)
+    url_template = get_ryr_url_template()
+    url = url_template.format(origin_iata, dest_iata)
     params = {"outboundMonthOfDate": month_str, "currency": curr}
     try:
         r = requests.get(url, params=params, headers=HEADERS, timeout=20)
@@ -26,6 +48,7 @@ def fetch_cheapest_per_day_map(origin_iata: str, dest_iata: str, y: int, m: int,
         return {}
     except ValueError:
         return {}
+    ...
     outbound = data.get("outbound", {}) or {}
     fares = outbound.get("fares", []) or []
     result = {}
@@ -191,7 +214,7 @@ class PriceChart(FigureCanvas):
 
 
 class Worker(QObject):
-    finished = Signal(dict, list, dict, str)  # per_route, combined, chart_series, error
+    finished = Signal(dict, list, dict, str)
 
     def __init__(self, params):
         super().__init__()
@@ -211,18 +234,23 @@ class Worker(QObject):
         chart_series: Dict[str, List[Tuple[date, float]]] = {}
         error = ""
 
+        combined: List[Candidate] = []  # 👈 WICHTIG: hier, VOR dem try
+
         try:
             start_date: date = p["start_date"]
             end_date: date = p["end_date"]
             for (o, d) in routes:
                 label = f"{o} ↔ {d}"
-                cands = find_roundtrips_for_route_by_dates(o, d, start_date, end_date, min_days, max_days, currency, month_cache)
+                cands = find_roundtrips_for_route_by_dates(
+                    o, d, start_date, end_date, min_days, max_days, currency, month_cache
+                )
                 per_route[label] = cands[:top_n]
                 all_cands.extend(cands)
 
                 best_per_day: Dict[str, float] = {}
                 for c in cands:
                     best_per_day[c.out_day] = min(best_per_day.get(c.out_day, float('inf')), c.total)
+
                 points: List[Tuple[date, float]] = []
                 for day_str, price in best_per_day.items():
                     try:
@@ -232,7 +260,6 @@ class Worker(QObject):
                         pass
                 chart_series[label] = points
 
-            combined: List[Candidate] = []
             if len(routes) >= 2 and all_cands:
                 all_cands.sort(key=lambda x: (x.total, x.out_day))
                 combined = all_cands[:top_n]
